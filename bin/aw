@@ -178,9 +178,11 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
 # hand > assist > auto, first match wins. Parsing is real TOML via python3:
 # tomllib on 3.11+, the `tomli` backport below that. One reader, several modes,
 # so the import dance lives in exactly one place.
-zones_py() { # zones_py <mode> [arg]   modes: parse|zone|fenced|fence-paths|fence-orphans
+zones_py() { # zones_py <mode> [arg]
+  #   parse | zone <path> | fenced <path> | fence-paths
+  #   fence-orphans | fence-shape | fence-present <worktree>
   python3 - "$AGENTS_DIR/zones.toml" "$@" << 'PY'
-import sys, os, fnmatch, subprocess
+import sys, os, re, fnmatch, subprocess
 
 def die(msg):                        # exit 2 = "cannot answer", never "no"
     sys.stderr.write("aw: %s\n" % msg)
@@ -202,7 +204,21 @@ if os.path.exists(zf):
             data = tomllib.load(f)
     except Exception as e:
         die("cannot read %s: %s" % (zf, e))
-fence = data.get("fence", {}).get("paths", [])
+def globs(section):
+    v = data.get(section, {}).get("paths", [])
+    if not isinstance(v, list):
+        die("%s: [%s].paths must be a list of glob strings" % (zf, section))
+    return v
+
+# Validate every pattern before answering anything: a bad entry hiding behind
+# an earlier match would otherwise surface as a wrong answer, not an error.
+for _sec in ("hand", "assist", "auto", "fence"):
+    for _g in globs(_sec):
+        if not isinstance(_g, str):
+            die("bad pattern in %s: [%s].paths contains %r, which is not a string"
+                % (zf, _sec, _g))
+
+fence = globs("fence")
 
 def hit(p, g):
     if fnmatch.fnmatch(p, g): return True
@@ -211,28 +227,61 @@ def hit(p, g):
         return p == base or fnmatch.fnmatch(p, base + "/*")
     return False
 
+def fence_sanity():
+    """Fencing the contract layer would disable the very things that police
+    the agent: no zones.toml in the worktree means every path resolves to
+    "assist" and `aw guard` exits 0, and no gate.sh means the gate exits 127
+    and burns every attempt. Refuse instead of silently disarming."""
+    for essential in (".agents/zones.toml", ".agents/gate.sh"):
+        for g in fence:
+            if hit(essential, g):
+                die("fence pattern '%s' would remove %s from agent worktrees, "
+                    "which disables the zone guard and the gate — narrow the pattern"
+                    % (g, essential))
+
 def zone_of(path):
     for zone in ("hand", "assist", "auto"):
-        for g in data.get(zone, {}).get("paths", []):
+        for g in globs(zone):
             if hit(path, g):
                 return zone
     return "assist"
+
+def tracked_in(wt=None):
+    cmd = ["git"] + (["-C", wt] if wt else []) + ["ls-files"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+    if r.returncode != 0:
+        die("git ls-files failed in %s" % (wt or os.getcwd()))
+    return r.stdout.splitlines()
 
 if mode == "parse":                                    # exit 0 = readable TOML
     pass
 elif mode == "zone":
     print(zone_of(args[0]))
-elif mode == "fenced":                                 # exit 0 = path is fenced
-    sys.exit(0 if any(hit(args[0], g) for g in fence) else 1)
+elif mode == "fenced":         # 0 = fenced, 3 = not fenced, 2 = cannot tell.
+    fence_sanity()
+    raise SystemExit(0 if any(hit(args[0], g) for g in fence) else 3)
 elif mode == "fence-paths":
+    fence_sanity()
     for g in fence:
         print(g)
 elif mode == "fence-orphans":                          # typo detection for doctor
-    tracked = subprocess.run(["git", "ls-files"], stdout=subprocess.PIPE,
-                             universal_newlines=True).stdout.splitlines()
+    fence_sanity()
+    tracked = tracked_in()
     for g in fence:
         if not any(hit(p, g) for p in tracked):
             print(g)
+elif mode == "fence-shape":    # patterns where gitignore and fnmatch may differ
+    fence_sanity()
+    plain = re.compile(r"^[^*?\[\]!/][^*?\[\]!]*/\*\*$")
+    for g in fence:
+        if not plain.match(g):
+            print(g)
+elif mode == "fence-present":  # fenced files still on disk in <worktree>
+    fence_sanity()
+    wt = args[0]
+    for p in tracked_in(wt):
+        if any(hit(p, g) for g in fence) and os.path.exists(os.path.join(wt, p)):
+            print(p)
 else:
     die("internal error: unknown zones mode '%s'" % mode)
 PY
@@ -254,16 +303,15 @@ load_fence() {
   FENCE_LOADED=yes
 }
 
-has_fence()      { load_fence; [ -n "$FENCE_PATTERNS" ]; }
-fence_patterns() { load_fence; printf '%s\n' "$FENCE_PATTERNS"; }
+has_fence() { load_fence; [ -n "$FENCE_PATTERNS" ]; }
 
-is_fenced() { # is_fenced <path>   0 = fenced, 1 = not, dies if it cannot tell
+is_fenced() { # is_fenced <path>   0 = fenced, 3 = not; anything else is an error
   local rc=0
-  zones_py fenced "$1" >/dev/null 2>&1 || rc=$?
+  zones_py fenced "$1" >/dev/null || rc=$?      # stderr stays visible on purpose
   case "$rc" in
     0) return 0 ;;
-    1) return 1 ;;
-    *) die "cannot determine the fence from .agents/zones.toml — refusing to guess" ;;
+    3) return 1 ;;
+    *) die "cannot determine whether '$1' is fenced — refusing to guess" ;;
   esac
 }
 
@@ -286,8 +334,32 @@ fence_apply() { # fence_apply <worktree>
   load_fence
   while IFS= read -r g; do [ -n "$g" ] && pats+=("!$g"); done <<< "$FENCE_PATTERNS"
   [ "${#pats[@]}" -gt 0 ] || return 0
-  git -C "$wt" sparse-checkout init --no-cone >&2
-  git -C "$wt" sparse-checkout set '/*' "${pats[@]}" >&2
+  git -C "$wt" sparse-checkout init --no-cone >&2 \
+    || die "cannot enable sparse checkout in $wt (git >= 2.25 required for [fence])"
+  git -C "$wt" sparse-checkout set '/*' "${pats[@]}" >&2 \
+    || die "sparse-checkout could not apply the fence patterns in $wt"
+}
+
+# Applying the patterns is not proof they took: git refuses to remove a file
+# with local modifications and only warns. Check the tree, not the config.
+fence_verify() { # fence_verify <worktree>
+  local wt="$1" left
+  left="$(zones_py fence-present "$wt")" || die "cannot verify the fence in $wt"
+  [ -z "$left" ] && return 0
+  die "fenced paths are STILL present in $wt:
+$(printf '%s\n' "$left" | sed 's/^/  /')
+git will not drop a file with local changes. Commit or discard them in the
+worktree, or start clean with: aw drop <task-id>"
+}
+
+# (Re-)apply the fence to a worktree that may predate it, then prove it took.
+# No-op when no fence is configured. Called on every `aw run` and `aw scout`,
+# because a worktree created before a fence was added or widened would
+# otherwise hand the fenced paths straight to the implementer.
+fence_enforce() { # fence_enforce <worktree>
+  has_fence || return 0
+  fence_apply "$1"
+  fence_verify "$1"
 }
 
 cmd_zone() {
@@ -337,6 +409,7 @@ cmd_new() {
     git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
     fence_apply "$wt"
     git -C "$wt" checkout >&2
+    fence_verify "$wt"
   else
     git worktree add -b "$br" "$wt" HEAD >&2
   fi
@@ -349,6 +422,7 @@ cmd_run() {
   local wt br attempt=1 gate_note="" title fnote
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || wt="$(cmd_new "$task")"
+  fence_enforce "$wt"        # the worktree may predate the fence, or a widening
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
   load_fence; fnote="$(fence_note)"
 
@@ -455,7 +529,7 @@ cmd_land() {
 }
 
 cmd_drop() {
-  local task="" keep="" a
+  local task="" keep="" a rem=""
   local wt br
   for a in "$@"; do
     case "$a" in
@@ -468,7 +542,17 @@ cmd_drop() {
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   git worktree remove "$wt" --force 2>/dev/null || true
   if [ -n "$keep" ]; then
-    echo "aw: dropped worktree for $task — branch $br kept (it is on the remote)"
+    local where
+    if ! git remote get-url origin >/dev/null 2>&1; then
+      where="(no 'origin' remote)"
+    elif ! rem="$(git ls-remote --heads origin "$br" 2>/dev/null)"; then
+      where="(could not reach origin to check)"
+    elif [ -n "$rem" ]; then
+      where="(it is on origin)"
+    else
+      where="— NOT on origin yet: git push -u origin $br"
+    fi
+    echo "aw: dropped worktree for $task — branch $br kept $where"
   else
     git branch -D "$br" 2>/dev/null || true
     echo "aw: dropped $task"
@@ -519,6 +603,7 @@ scout_root() {
     fence_apply "$wt"
     git -C "$wt" checkout >&2
   fi
+  fence_verify "$wt"
   echo "$wt"
 }
 
@@ -599,15 +684,22 @@ cmd_doctor() {
   echo "project"
   [ -x "$AGENTS_DIR/gate.sh" ] && pass ".agents/gate.sh executable" || fail ".agents/gate.sh missing or not executable"
   if [ -f "$AGENTS_DIR/zones.toml" ]; then
-    local nfence orphan
+    local nfence orphan odd fpaths
     if zones_py parse >/dev/null 2>&1; then
       pass "zones.toml parses"
-      nfence="$(zones_py fence-paths | grep -c . || true)"
-      if [ "${nfence:-0}" -gt 0 ]; then
-        pass "fence: $nfence pattern(s) removed from agent worktrees"
-        while IFS= read -r orphan; do
-          [ -n "$orphan" ] && note "fence pattern matches no tracked file (typo?): $orphan"
-        done < <(zones_py fence-orphans 2>/dev/null || true)
+      if fpaths="$(zones_py fence-paths 2>&1)"; then
+        nfence="$(printf '%s\n' "$fpaths" | grep -c . || true)"
+        if [ "${nfence:-0}" -gt 0 ]; then
+          pass "fence: $nfence pattern(s) removed from agent worktrees"
+          while IFS= read -r orphan; do
+            [ -n "$orphan" ] && note "fence pattern matches no tracked file (typo?): $orphan"
+          done < <(zones_py fence-orphans 2>/dev/null || true)
+          while IFS= read -r odd; do
+            [ -n "$odd" ] && note "fence pattern is not the plain 'subsystem/**' form: $odd — sparse checkout reads it as gitignore, aw zone as fnmatch (ARCHITECTURE.md § 5, caveat 3)"
+          done < <(zones_py fence-shape 2>/dev/null || true)
+        fi
+      else
+        fail "${fpaths#aw: }"
       fi
     else
       fail "zones.toml unreadable (bad TOML, or no tomllib/tomli — see binaries): agent/* commits are BLOCKED until this is fixed"

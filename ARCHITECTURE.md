@@ -204,6 +204,19 @@ confused agent asks instead of digging.
 4. **It is per-worktree, not per-repo.** Your own working tree is untouched —
    the sparse config is written to the worktree-scoped config, so nothing
    disappears from under your editor.
+5. **A worktree can predate the fence.** Sparse rules are applied when a
+   worktree is built, so one created before `[fence]` existed — or before it
+   was widened — still holds the paths you have since fenced. `aw run` and
+   `aw scout` therefore re-apply and *verify* the fence on every call, and
+   refuse to run if a fenced file survives (git will not remove a file with
+   local modifications). Anything you drive by hand rather than through those
+   commands gets no such refresh: after changing `[fence]`, treat existing
+   worktrees in `aw ls` as stale and `aw drop` them.
+
+Fencing `.agents/**` is refused outright. Removing `zones.toml` from a worktree
+would make every path resolve to `assist` and `aw guard` exit 0 — the fence
+would quietly disarm the hand-zone boundary — and removing `gate.sh` would make
+the gate exit 127 and burn every retry.
 
 ---
 
