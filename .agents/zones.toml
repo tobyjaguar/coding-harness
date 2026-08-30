@@ -6,6 +6,10 @@
 #   assist  agents edit, you review every diff line by line.
 #   auto    agents edit, you review the summary.
 #
+# [fence] is a separate, stronger axis: fenced paths are physically REMOVED from
+# agent worktrees (sparse checkout), so a non-Anthropic provider never sees them.
+# It prevents incidental exposure, not exfiltration — see ARCHITECTURE.md § 5.
+#
 # Review changes to this file as carefully as you would a security policy.
 # Zone creep is the quiet failure mode of this system.
 #
@@ -36,3 +40,15 @@ paths = [
   "**/fixtures/**",
   ".github/**",
 ]
+
+# Optional. Uncomment to keep a subsystem out of every agent worktree entirely.
+# Fence whole subsystems you also exclude from the gate: a fenced path that the
+# build needs (a workspace member, a required module) breaks builds in the
+# worktree, because it is genuinely not there.
+#
+# [fence]
+# reason = "Client work under NDA — no third-party model sees this tree."
+# paths = [
+#   "crates/audat-nda/**",
+#   "docs/audits/**",
+# ]

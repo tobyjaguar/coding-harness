@@ -7,7 +7,9 @@
 # target repo, puts `aw` and `loom-session` on your PATH (symlinked by default,
 # so harness updates propagate; --copy-bin to copy instead), and installs the
 # hand-zone pre-commit hook. Never clobbers files you may have edited:
-# zones.toml, AGENTS.md, opencode.json are skipped if they already exist.
+# zones.toml, AGENTS.md, opencode.json are skipped if they already exist —
+# and an existing pre-commit hook is moved to .git/hooks/pre-commit.pre-loom
+# and chained (the guard runs first, then your hook). Re-running is a no-op.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -70,7 +72,7 @@ ENVEOF
   echo "  created $LOOM_ENV (add your keys)"
 fi
 
-echo "installing pre-commit hook"
+echo "installing pre-commit hook (chaining any existing one)"
 ( cd "$TARGET" && "$BIN_DIR/aw" install-hooks )
 
 cat << DONE

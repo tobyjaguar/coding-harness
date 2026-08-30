@@ -36,7 +36,10 @@ bin/loom-session           tmux layout, works with plain vim
 
 .agents/
   gate.sh                  fmt / clippy / test. The deterministic reviewer.
-  zones.toml               hand / assist / auto. Enforced by pre-commit hook.
+                           A `gate:` target in your Makefile wins over auto-detection.
+  zones.toml               hand / assist / auto, plus optional [fence].
+                           Enforced by pre-commit hook (hand) and sparse
+                           checkout (fence).
   PLAN_TEMPLATE.md  TASK_TEMPLATE.md
   plans/  tasks/  decisions/  reviews/
 
@@ -50,7 +53,8 @@ nvim/codecompanion.lua     optional editor-chat layer (Neovim only)
 
 ## Requirements
 
-`git`, `bash`, `python3` ≥ 3.11 (for `tomllib`), `jq`, `curl`, plus
+`git`, `bash`, `python3` ≥ 3.11 (for `tomllib`) — or any python3 with the
+`tomli` backport installed (`pip install tomli`) — plus `jq`, `curl`, and
 [`opencode`](https://opencode.ai) and the `claude` CLI (logged in to your
 subscription). `tmux` optional (for `loom-session`). Everything is
 GNU/BSD-portable — the same scripts run on macOS and Linux; `aw doctor`
@@ -62,7 +66,8 @@ From zero to verified, in order:
 
 ```sh
 # 1. base tools — Debian/Ubuntu shown; use dnf/pacman/brew equivalents
-sudo apt install -y git jq curl python3 tmux        # python3 must be >= 3.11
+sudo apt install -y git jq curl python3 tmux        # python3 >= 3.11, or
+                                                     # pip install tomli
 
 # 2. the two agent CLIs
 curl -fsSL https://opencode.ai/install | bash        # or: npm i -g opencode-ai
@@ -87,6 +92,9 @@ when the directory exists; log out/in if not).
 
 ```sh
 ./install.sh /path/to/audat        # copies harness, links bin, installs hook
+                                   # (an existing pre-commit hook is moved to
+                                   # pre-commit.pre-loom and still runs, after
+                                   # the guard; re-running install is a no-op)
 
 cd /path/to/audat
 $EDITOR .agents/zones.toml         # do this honestly, it is the point
@@ -132,6 +140,40 @@ Tasks marked `HAND` in the plan you write yourself. That is deliberate —
 those, and the pre-commit hook enforces the boundary.
 
 When you hit a rate limit anywhere: `eval "$(aw tier lean)"` and keep going.
+
+### PR-mode landing
+
+In a repo with review gates, merging straight into your current branch is the
+wrong last step. `--pr` (or `LOOM_LAND=pr` in the environment; the flag wins)
+swaps the tail of the loop:
+
+```sh
+aw land 0007-c --pr             # gate in the worktree, then: git push -u origin agent/0007-c
+                                # prints a ready `gh pr create ...` line — it never runs it
+                                # nothing is merged, the branch stays, the checkbox stays unticked
+aw drop 0007-c --keep-branch    # later: reclaim the worktree, keep the pushed branch
+```
+
+Tick the plan checkbox by hand when the PR merges. `aw land 0007-c` (or
+`--merge`) is unchanged: gate, merge here, clean up, tick.
+
+### Read fences
+
+`[fence]` in `zones.toml` is stronger than `hand`. Where `hand` says "agents may
+read but not edit", `fence` says *not even read*: those paths are removed from
+every agent worktree by a sparse checkout, so the third-party models that do the
+implementer and scout work never see them.
+
+```toml
+[fence]
+reason = "Client work under NDA — no third-party model sees this tree."
+paths = ["crates/audat-nda/**", "docs/audits/**"]
+```
+
+Read the honest limits in `ARCHITECTURE.md` § 5 before relying on it — in
+particular, a fenced path the build needs will break the build in the worktree.
+`aw zone <path>` reports fencing, and `aw doctor` warns about fence patterns
+that match no tracked file.
 
 ## Editors
 
