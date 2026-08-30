@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# loom-session — the Tier-0 layout. Plain vim, tmux, nothing else required.
+#
+#   ┌────────────────────┬──────────────────┐
+#   │                    │  shell (aw ...)  │
+#   │   vim              ├──────────────────┤
+#   │                    │  gate / watch    │
+#   └────────────────────┴──────────────────┘
+#
+#   loom-session [dir]     start or attach to the session for a repo
+set -euo pipefail
+
+dir="${1:-$PWD}"
+dir="$(cd "$dir" && pwd -P)"
+name="loom-$(basename "$dir" | tr -c 'a-zA-Z0-9' '-' | sed 's/-*$//')"
+
+command -v tmux >/dev/null 2>&1 || { echo "loom-session: tmux not installed" >&2; exit 1; }
+
+if tmux has-session -t "$name" 2>/dev/null; then
+  exec tmux attach -t "$name"
+fi
+
+tmux new-session  -d -s "$name" -c "$dir" -x 220 -y 60 "${EDITOR:-vim}"
+tmux split-window -h -t "$name" -c "$dir" -l 45%
+tmux split-window -v -t "$name" -c "$dir" -l 40% \
+  "command -v cargo-watch >/dev/null 2>&1 && [ -f Cargo.toml ] && cargo watch -s ./.agents/gate.sh || exec ${SHELL:-bash}"
+tmux select-pane  -t "$name:0.0"
+exec tmux attach  -t "$name"

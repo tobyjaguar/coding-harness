@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "loom: gate",
+      "type": "shell",
+      "command": "./.agents/gate.sh",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "presentation": { "clear": true, "reveal": "always" }
+    },
+    {
+      "label": "loom: scout",
+      "type": "shell",
+      "command": "aw scout \"${input:scoutQ}\"",
+      "problemMatcher": []
+    },
+    {
+      "label": "loom: run task",
+      "type": "shell",
+      "command": "aw run ${input:taskId}",
+      "problemMatcher": []
+    },
+    {
+      "label": "loom: check task (cross-provider review)",
+      "type": "shell",
+      "command": "aw check ${input:taskId}",
+      "problemMatcher": []
+    },
+    {
+      "label": "loom: doctor",
+      "type": "shell",
+      "command": "aw doctor",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    { "id": "scoutQ", "type": "promptString", "description": "Scout question (where is X / who calls Y)" },
+    { "id": "taskId", "type": "promptString", "description": "Task id (e.g. 0007-c)" }
+  ]
+}

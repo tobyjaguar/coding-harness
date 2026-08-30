@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Install the Loom harness into a target repository.
+#
+#   ./install.sh /path/to/repo [--copy-bin]
+#
+# Copies the contract layer (.agents/) and agent config (.opencode/) into the
+# target repo, puts `aw` and `loom-session` on your PATH (symlinked by default,
+# so harness updates propagate; --copy-bin to copy instead), and installs the
+# hand-zone pre-commit hook. Never clobbers files you may have edited:
+# zones.toml, AGENTS.md, opencode.json are skipped if they already exist.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+TARGET="${1:?usage: ./install.sh /path/to/repo [--copy-bin]}"
+COPY_BIN="${2:-}"
+BIN_DIR="${LOOM_BIN:-$HOME/.local/bin}"
+
+[ -d "$TARGET/.git" ] || { echo "install: $TARGET is not a git repository" >&2; exit 1; }
+TARGET="$(cd "$TARGET" && pwd -P)"
+
+put() { # put <src> <dst> <mode: clobber|keep>
+  local src="$1" dst="$2" mode="$3"
+  if [ -e "$dst" ] && [ "$mode" = keep ]; then
+    echo "  keep   ${dst#$TARGET/} (exists, not overwritten)"
+  else
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+    echo "  install ${dst#$TARGET/}"
+  fi
+}
+
+echo "installing contract layer into $TARGET"
+for d in plans tasks decisions reviews; do mkdir -p "$TARGET/.agents/$d"; done
+put "$HERE/.agents/gate.sh"          "$TARGET/.agents/gate.sh"          keep
+chmod +x "$TARGET/.agents/gate.sh"
+put "$HERE/.agents/zones.toml"       "$TARGET/.agents/zones.toml"       keep
+put "$HERE/.agents/PLAN_TEMPLATE.md" "$TARGET/.agents/PLAN_TEMPLATE.md" clobber
+put "$HERE/.agents/TASK_TEMPLATE.md" "$TARGET/.agents/TASK_TEMPLATE.md" clobber
+put "$HERE/AGENTS.md"                "$TARGET/AGENTS.md"                keep
+
+echo "installing agent config"
+put "$HERE/.opencode/opencode.json"  "$TARGET/.opencode/opencode.json"  keep
+for f in "$HERE"/.opencode/prompts/*.md; do
+  put "$f" "$TARGET/.opencode/prompts/$(basename "$f")" clobber
+done
+
+put "$HERE/vscode/tasks.json"      "$TARGET/.vscode/tasks.json"       keep
+
+echo "installing bin → $BIN_DIR"
+mkdir -p "$BIN_DIR"
+for b in aw loom-session; do
+  if [ "$COPY_BIN" = "--copy-bin" ]; then cp "$HERE/bin/$b" "$BIN_DIR/$b"; chmod +x "$BIN_DIR/$b"
+  else ln -sf "$HERE/bin/$b" "$BIN_DIR/$b"; fi
+  echo "  $BIN_DIR/$b"
+done
+case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "  NOTE: $BIN_DIR is not on your PATH" ;; esac
+
+LOOM_ENV="${LOOM_ENV:-$HOME/.config/loom/env}"
+if [ ! -f "$LOOM_ENV" ]; then
+  mkdir -p "$(dirname "$LOOM_ENV")"
+  umask 177
+  cat > "$LOOM_ENV" << 'ENVEOF'
+# Loom provider keys — sourced automatically by `aw`. KEY=value lines.
+# Lives outside every repo on purpose. Keep it chmod 600.
+ZHIPU_API_KEY=PASTE-YOUR-GLM-CODING-PLAN-KEY-HERE
+# DEEPSEEK_API_KEY=
+# MOONSHOT_API_KEY=
+ENVEOF
+  umask 022
+  echo "  created $LOOM_ENV (add your keys)"
+fi
+
+echo "installing pre-commit hook"
+( cd "$TARGET" && "$BIN_DIR/aw" install-hooks )
+
+cat << DONE
+
+Done. Next steps in $TARGET:
+  1. \$EDITOR .agents/zones.toml     # five minutes, do it honestly
+  2. \$EDITOR AGENTS.md              # fill in the repo facts, keep it <100 lines
+  3. \$EDITOR ~/.config/loom/env    # paste ZHIPU_API_KEY (GLM Coding Plan);
+                                    # aw sources this file automatically
+  4. aw doctor                       # verifies binaries, keys, and model IDs
+  5. aw plan "something small"       # one end-to-end feature before trusting it
+DONE

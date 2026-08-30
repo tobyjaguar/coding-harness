@@ -1,0 +1,77 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "// providers": "All built-in: zai-coding-plan (GLM Coding Plan sub, ZHIPU_API_KEY), moonshotai (MOONSHOT_API_KEY), deepseek (DEEPSEEK_API_KEY). No custom provider blocks needed, and no Anthropic anywhere \u2014 the architect runs on the Claude subscription through the `claude` CLI, driven by `aw`, never through an API key.",
+  "// models": "IDs move fast. Verify with: aw doctor   (live /models check) or: opencode models",
+  "model": "zai-coding-plan/glm-5.3",
+  "small_model": "zai-coding-plan/glm-5.3-flash",
+  "agent": {
+    "build": {
+      "description": "General hands-on work under your direct supervision.",
+      "mode": "primary",
+      "model": "zai-coding-plan/glm-5.3",
+      "temperature": 0.2,
+      "prompt": "{file:./prompts/build.md}",
+      "permission": {
+        "edit": "allow",
+        "bash": "ask"
+      }
+    },
+    "architect": {
+      "description": "FALLBACK architect for when the Claude subscription is rate-limited (aw plan routes to claude-sub first). Designs features, writes plans and task specs under .agents/, never edits source.",
+      "mode": "primary",
+      "model": "zai-coding-plan/glm-5.3",
+      "temperature": 0.3,
+      "prompt": "{file:./prompts/architect.md}",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "allow"
+      }
+    },
+    "scout": {
+      "description": "Read-only codebase exploration. Answers where/what/who-calls questions with file:line citations. Use this instead of reading files yourself.",
+      "mode": "all",
+      "model": "zai-coding-plan/glm-5.3-flash",
+      "temperature": 0.1,
+      "prompt": "{file:./prompts/scout.md}",
+      "permission": {
+        "edit": "deny",
+        "bash": "allow"
+      }
+    },
+    "implementer": {
+      "description": "Implements exactly one task file inside its own worktree. Must pass the gate.",
+      "mode": "all",
+      "model": "zai-coding-plan/glm-5.3",
+      "temperature": 0.15,
+      "prompt": "{file:./prompts/implementer.md}",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "reviewer": {
+      "description": "Reviews a diff against its task spec, printing the review to stdout (aw saves it). Runs on a different provider than the implementer so failure modes are decorrelated.",
+      "mode": "all",
+      "model": "moonshotai/kimi-k2.5",
+      "temperature": 0.1,
+      "prompt": "{file:./prompts/reviewer.md}",
+      "permission": {
+        "edit": "deny",
+        "bash": "allow"
+      }
+    }
+  },
+  "provider": {
+    "zai-coding-plan": {
+      "models": {
+        "glm-5.3": {
+          "name": "GLM 5.3"
+        },
+        "glm-5.3-flash": {
+          "name": "GLM 5.3 Flash"
+        }
+      }
+    }
+  }
+}

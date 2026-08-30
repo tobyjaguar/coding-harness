@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+# aw — agent worktree dispatcher (Loom)
+#
+# One task = one worktree = one branch = one reviewable diff.
+# Your working tree is never touched by an agent.
+#
+#   aw plan  "streaming resampler"   architect session (Claude sub via `claude`)
+#   aw plan -p "topic"               headless plan (falls back to cheap providers)
+#   aw scout "where is decode_flac"  one-shot cheap read-only lookup
+#   aw new   0007-c                  create worktree + branch for a task
+#   aw run   0007-c                  run the implementer in that worktree
+#   aw check 0007-c                  cheap cross-provider review of the diff
+#   aw diff  0007-c                  open the task diff read-only in $EDITOR
+#   aw land  0007-c                  gate, merge, clean up, tick the checkbox
+#   aw drop  0007-c                  discard worktree and branch
+#   aw ls                            list active agent worktrees
+#   aw gate                          run the gate here
+#   aw zone  <path>                  which zone a path belongs to
+#   aw tier  lean|standard|deep      print export line for the model tier
+#   aw doctor                        verify binaries, keys, and MODEL IDS
+#   aw guard                         pre-commit zone check (used by the hook)
+#   aw install-hooks                 install the hand-zone commit guard
+#
+# Env:
+#   LOOM_TIER=lean|standard|deep   model tier            (default standard)
+#   LOOM_SKIP="zai deepseek"       providers to skip     (claude|zai|moonshotai|deepseek)
+#   LOOM_MAX_ATTEMPTS=3            implementer gate retries
+#   LOOM_WORKTREES=/path           where worktrees live
+#
+# Anthropic policy: subscription only, on purpose. The architect runs through
+# the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
+# anywhere in this system. When the subscription is rate-limited, roles fall
+# back to cheap providers instead of an expensive API bill.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "aw: not inside a git repository" >&2; exit 1; }
+cd "$ROOT"
+
+AGENTS_DIR="$ROOT/.agents"
+PROMPTS_DIR="$ROOT/.opencode/prompts"
+WT_ROOT="${LOOM_WORKTREES:-$(dirname "$ROOT")/.loom-worktrees/$(basename "$ROOT")}"
+TIER="${LOOM_TIER:-standard}"
+MAX_ATTEMPTS="${LOOM_MAX_ATTEMPTS:-3}"
+SKIP="${LOOM_SKIP:-}"
+
+# Provider keys live in one file outside every repo (chmod 600). Sourced here
+# so aw and everything it launches (opencode included) see them without the
+# keys ever entering a repo or a shell profile.
+LOOM_ENV="${LOOM_ENV:-$HOME/.config/loom/env}"
+if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
+for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
+  case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
+done
+
+# opencode's built-in zai provider reads ZHIPU_API_KEY; accept ZAI_API_KEY too.
+if [ -n "${ZAI_API_KEY:-}" ] && [ -z "${ZHIPU_API_KEY:-}" ]; then
+  export ZHIPU_API_KEY="$ZAI_API_KEY"
+fi
+
+die()  { echo "aw: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Portable in-place sed (BSD sed on macOS needs -i '').
+sedi() {
+  local expr="$1" file="$2"
+  if sed --version >/dev/null 2>&1; then sed -i -e "$expr" "$file"
+  else sed -i '' -e "$expr" "$file"; fi
+}
+
+relpath() { # relpath <path> [<base>]
+  python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+    "$1" "${2:-$ROOT}"
+}
+
+# ---------------------------------------------------------------- model tiers
+# Ordered fallback chains. "claude-sub" means the `claude` CLI on your
+# subscription; everything else is opencode's built-in provider/model IDs.
+# Verify IDs with: aw doctor   (they move fast)
+models_for() {
+  local role="$1"
+  case "$TIER:$role" in
+    deep:architect|standard:architect)
+                         echo "claude-sub zai-coding-plan/glm-5.3 moonshotai/kimi-k2.5" ;;
+    lean:architect)      echo "zai-coding-plan/glm-5.3 moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro" ;;
+
+    deep:implementer)    echo "zai-coding-plan/glm-5.3 moonshotai/kimi-k2.7-code deepseek/deepseek-v4-pro" ;;
+    standard:implementer|lean:implementer)
+                         echo "zai-coding-plan/glm-5.3 deepseek/deepseek-v4-pro moonshotai/kimi-k2.5" ;;
+
+    deep:reviewer)       echo "claude-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro" ;;
+    standard:reviewer)   echo "moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro zai-coding-plan/glm-5.3" ;;
+    lean:reviewer)       echo "deepseek/deepseek-v4-flash zai-coding-plan/glm-5.3-flash" ;;
+
+    *:scout)             echo "zai-coding-plan/glm-5.3-flash deepseek/deepseek-v4-flash" ;;
+    *)                   echo "zai-coding-plan/glm-5.3" ;;
+  esac
+}
+
+key_for_provider() {
+  case "$1" in
+    zai|zai-coding-plan)
+                echo "${ZHIPU_API_KEY:-}" ;;
+    moonshotai) echo "${MOONSHOT_API_KEY:-}" ;;
+    deepseek)   echo "${DEEPSEEK_API_KEY:-}" ;;
+    *)          echo "" ;;
+  esac
+}
+
+provider_of() { case "$1" in claude-sub) echo "claude" ;; *) echo "${1%%/*}" ;; esac; }
+
+skipped() { # skipped <provider>
+  local p
+  for p in $SKIP; do
+    case "$1" in "$p"*) return 0 ;; esac
+    [ "$p" = anthropic ] && [ "$1" = claude ] && return 0
+  done
+  return 1
+}
+
+usable() { # usable <model-token>
+  local prov; prov="$(provider_of "$1")"
+  skipped "$prov" && return 1
+  if [ "$1" = claude-sub ]; then have claude
+  else [ -n "$(key_for_provider "$prov")" ] && have opencode; fi
+}
+
+candidates() { local m out=""; for m in $(models_for "$1"); do usable "$m" && out="$out $m"; done; echo "$out"; }
+pick_model() {
+  local c; c="$(candidates "$1")"
+  [ -n "${c// /}" ] || die "no usable model for role '$1' at tier '$TIER' (skip='$SKIP') — set an API key or install claude/opencode"
+  echo "$c" | awk '{print $1}'
+}
+
+looks_rate_limited() { # looks_rate_limited <logfile>
+  grep -qiE '429|rate[ _-]?limit|too many request|quota|overloaded|exhaust|usage limit|insufficient[ _-]?(balance|quota|credit)' "$1" 2>/dev/null
+}
+
+run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
+  local role="$1" model="$2" wd="$3" prompt="$4" log="$5" rc=0
+  if [ "$model" = claude-sub ]; then
+    ( cd "$wd" && claude -p \
+        --append-system-prompt "$(cat "$PROMPTS_DIR/$role.md")" \
+        "$prompt" ) > "$log" 2>&1 || rc=$?
+  else
+    ( cd "$wd" && opencode run --agent "$role" --model "$model" "$prompt" ) \
+      > "$log" 2>&1 || rc=$?
+  fi
+  cat "$log"
+  return $rc
+}
+
+run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
+  local role="$1" wd="$2" prompt="$3"
+  local log="${4:-$(mktemp "${TMPDIR:-/tmp}/aw-$role.XXXXXX")}"
+  local m tried=""
+  for m in $(candidates "$role"); do
+    tried="yes"
+    echo "aw: [$role] running on $m (tier $TIER)"
+    if run_headless "$role" "$m" "$wd" "$prompt" "$log"; then
+      return 0
+    elif looks_rate_limited "$log"; then
+      echo "aw: [$role] $m looks rate-limited — falling back" >&2
+    else
+      echo "aw: [$role] $m failed (not a rate limit) — see output above" >&2
+      return 1
+    fi
+  done
+  [ -n "$tried" ] && die "every model in the $role chain is rate-limited — try later or widen LOOM_SKIP"
+  die "no usable model for role '$role' at tier '$TIER' (skip='$SKIP')"
+}
+
+# ---------------------------------------------------------------------- zones
+# hand > assist > auto, first match wins. Parsing is real TOML via python3.
+zone_of() { # zone_of <repo-relative-path>
+  python3 - "$1" "$AGENTS_DIR/zones.toml" << 'PY'
+import sys, fnmatch, os, tomllib
+path, zf = sys.argv[1], sys.argv[2]
+if not os.path.exists(zf):
+    print("assist"); sys.exit(0)
+with open(zf, "rb") as f:
+    data = tomllib.load(f)
+def hit(p, g):
+    if fnmatch.fnmatch(p, g): return True
+    if g.endswith("/**"):
+        base = g[:-3]
+        return p == base or fnmatch.fnmatch(p, base + "/*")
+    return False
+for zone in ("hand", "assist", "auto"):
+    for g in data.get(zone, {}).get("paths", []):
+        if hit(path, g):
+            print(zone); sys.exit(0)
+print("assist")
+PY
+}
+
+cmd_zone() {
+  local p="${1:?usage: aw zone <path>}"
+  p="$(relpath "$p")"
+  echo "$p → $(zone_of "$p")"
+}
+
+cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
+  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+  case "$branch" in agent/*) ;; *) return 0 ;; esac
+  local violations="" file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ "$(zone_of "$file")" = hand ] && violations="$violations
+  $file"
+  done < <(git diff --cached --name-only)
+  if [ -n "$violations" ]; then
+    echo "BLOCKED: agent branch '$branch' touches hand-zone paths:$violations" >&2
+    echo "" >&2
+    echo "These are yours to write. Reassign the task, or reclassify the zone" >&2
+    echo "deliberately in .agents/zones.toml." >&2
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------- worktrees
+wt_path()   { echo "$WT_ROOT/$1"; }
+branch_of() { echo "agent/$1"; }
+base_of()   { git config "branch.$(branch_of "$1").loombase" 2>/dev/null || git rev-parse HEAD; }
+
+cmd_new() {
+  local task="${1:?usage: aw new <task-id>}"
+  local wt br
+  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  [ -d "$wt" ] && die "worktree already exists: $wt"
+  [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
+  mkdir -p "$(dirname "$wt")"
+  git worktree add -b "$br" "$wt" HEAD >&2
+  git config "branch.$br.loombase" "$(git rev-parse HEAD)"
+  echo "$wt"
+}
+
+cmd_run() {
+  local task="${1:?usage: aw run <task-id>}"
+  local wt br attempt=1 gate_note="" title
+  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  [ -d "$wt" ] || wt="$(cmd_new "$task")"
+  title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
+
+  echo "aw: task $task  branch $br  tier $TIER"
+  while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+    echo "aw: attempt $attempt/$MAX_ATTEMPTS"
+    run_role implementer "$wt" "Implement the task in .agents/tasks/$task.md. \
+Read the plan it references first. Touch only the files it lists — check \
+.agents/zones.toml and never edit hand-zone paths. Run ./.agents/gate.sh and \
+fix failures until it exits 0. Write brief notes on what you did to \
+.agents/reviews/$task-done.md. If you cannot proceed, write why to \
+.agents/reviews/$task-blocked.md and stop.$gate_note" || true
+
+    if ( cd "$wt" && ./.agents/gate.sh > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
+      echo "aw: gate green"
+      ( cd "$wt" && git add -A && git commit -q -m "agent($task): $title" )
+      echo "aw: committed on $br — review with: aw check $task && aw diff $task"
+      return 0
+    fi
+    if [ -f "$wt/.agents/reviews/$task-blocked.md" ]; then
+      echo "aw: implementer reported blocked — see .agents/reviews/$task-blocked.md"
+      return 2
+    fi
+    gate_note=" PREVIOUS ATTEMPT FAILED THE GATE. Failing output (tail):
+$(tail -40 "$wt/.agents/reviews/$task-gate.log" 2>/dev/null)"
+    attempt=$((attempt + 1))
+  done
+
+  echo "aw: gate never went green after $MAX_ATTEMPTS attempts." >&2
+  echo "aw: this usually means the task spec is wrong. Revisit it with the architect." >&2
+  return 1
+}
+
+cmd_check() {
+  local task="${1:?usage: aw check <task-id>}"
+  local wt base review log
+  wt="$(wt_path "$task")"
+  [ -d "$wt" ] || die "no worktree for $task"
+  base="$(base_of "$task")"
+  ( cd "$wt" && git diff "$base" HEAD > ".agents/reviews/$task.patch" )
+  review="$wt/.agents/reviews/$task-review.md"
+  log="$(mktemp "${TMPDIR:-/tmp}/aw-review.XXXXXX")"
+  run_role reviewer "$wt" "Review the diff at .agents/reviews/$task.patch \
+against the task spec .agents/tasks/$task.md and the plan it references. \
+Print your review to stdout: scope check, correctness concerns, test coverage, \
+and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'." "$log"
+  cp "$log" "$review"
+  echo "aw: review saved to $(relpath "$review")"
+}
+
+cmd_diff() {
+  local task="${1:?usage: aw diff <task-id>}"
+  local wt base patch
+  wt="$(wt_path "$task")"
+  [ -d "$wt" ] || die "no worktree for $task"
+  base="$(base_of "$task")"
+  patch="$wt/.agents/reviews/$task.patch"
+  ( cd "$wt" && git diff "$base" HEAD > "$patch" )
+  ${EDITOR:-vim} -R -c 'set filetype=diff' "$patch"
+}
+
+cmd_land() {
+  local task="${1:?usage: aw land <task-id>}"
+  local force="${2:-}"
+  local wt br plan
+  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  [ -d "$wt" ] || die "no worktree for $task"
+  if [ "$force" != "--force" ]; then
+    echo "aw: running gate in worktree before landing"
+    ( cd "$wt" && ./.agents/gate.sh ) || die "gate is red in $br — fix it or land with: aw land $task --force"
+  fi
+  git merge --no-ff "$br" -m "land($task)"
+  git worktree remove "$wt" --force
+  git branch -d "$br"
+  plan="$(grep -rl -- "$task" "$AGENTS_DIR/plans" 2>/dev/null | head -1 || true)"
+  [ -n "$plan" ] && sedi "s/- \[ \] $task/- [x] $task/" "$plan"
+  echo "aw: landed $task"
+}
+
+cmd_drop() {
+  local task="${1:?usage: aw drop <task-id>}"
+  local wt br; wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  git worktree remove "$wt" --force 2>/dev/null || true
+  git branch -D "$br" 2>/dev/null || true
+  echo "aw: dropped $task"
+}
+
+cmd_ls() { git worktree list | grep -F "$WT_ROOT" || echo "(no agent worktrees)"; }
+
+# -------------------------------------------------------------------- agents
+cmd_plan() {
+  local headless="" topic
+  [ "${1:-}" = "-p" ] && { headless=yes; shift; }
+  topic="${*:?usage: aw plan [-p] \"<topic>\"}"
+  mkdir -p "$AGENTS_DIR/plans" "$AGENTS_DIR/tasks" "$AGENTS_DIR/reviews" "$AGENTS_DIR/decisions"
+  local prompt="Design: $topic. For codebase questions run 'aw scout \"<question>\"' \
+in the shell instead of reading source files yourself, and treat uncited scout \
+claims as unknown. Write a plan to .agents/plans/ (next number, kebab-slug) \
+following .agents/PLAN_TEMPLATE.md, and one task file per non-HAND task in \
+.agents/tasks/ following .agents/TASK_TEMPLATE.md. Respect .agents/zones.toml: \
+hand-zone work becomes a tutor-mode task (doc-comment contract, signatures with \
+todo!(), a failing test — never the implementation). Do not create or edit any \
+file outside .agents/."
+  local first; first="$(pick_model architect)"
+  if [ "$first" = claude-sub ] && [ -z "$headless" ]; then
+    echo "aw: architect on your Claude subscription (interactive). Ctrl-D to end."
+    claude --append-system-prompt "$(cat "$PROMPTS_DIR/architect.md")" "$prompt" \
+      || { echo "aw: claude exited non-zero — if rate-limited, try: eval \"\$(aw tier lean)\" && aw plan -p \"$topic\"" >&2; return 1; }
+  else
+    run_role architect "$ROOT" "$prompt"
+  fi
+}
+
+cmd_scout() {
+  local q="${*:?usage: aw scout \"<question>\"}"
+  run_role scout "$ROOT" "$q"
+}
+
+cmd_gate() { exec "$AGENTS_DIR/gate.sh"; }
+
+cmd_tier() {
+  local t="${1:?usage: aw tier lean|standard|deep}"
+  case "$t" in lean|standard|deep) ;; *) die "unknown tier: $t" ;; esac
+  echo "export LOOM_TIER=$t"
+  echo "# apply with: eval \"\$(aw tier $t)\"" >&2
+}
+
+# -------------------------------------------------------------------- doctor
+models_endpoint() {
+  case "$1" in
+    zai)             echo "https://api.z.ai/api/paas/v4/models" ;;
+    zai-coding-plan) echo "https://api.z.ai/api/coding/paas/v4/models" ;;
+    moonshotai) echo "https://api.moonshot.ai/v1/models" ;;
+    deepseek)   echo "https://api.deepseek.com/models" ;;
+  esac
+}
+
+all_referenced_models() {
+  local t r
+  for t in lean standard deep; do
+    for r in architect scout implementer reviewer; do
+      TIER=$t models_for "$r"
+    done
+  done | tr ' ' '\n' | grep -v '^claude-sub$' | grep . | sort -u
+  # plus whatever opencode.json pins
+  [ -f "$ROOT/.opencode/opencode.json" ] && have jq && \
+    jq -r '.. | .model? // empty' "$ROOT/.opencode/opencode.json" | sort -u
+}
+
+cmd_doctor() {
+  local ok=0 warn=0 bad=0
+  say()  { printf '  %-8s %s\n' "$1" "$2"; }
+  pass() { say "OK" "$1"; ok=$((ok+1)); }
+  note() { say "WARN" "$1"; warn=$((warn+1)); }
+  fail() { say "FAIL" "$1"; bad=$((bad+1)); }
+
+  echo "binaries"
+  for b in git python3 claude opencode; do
+    have "$b" && pass "$b ($(command -v "$b"))" || fail "$b missing"
+  done
+  for b in tmux jq curl; do have "$b" && pass "$b" || note "$b missing (optional)"; done
+  python3 -c 'import tomllib' 2>/dev/null && pass "python3 tomllib" || fail "python3 lacks tomllib (need >=3.11)"
+
+  echo "provider keys (opencode built-ins; no ANTHROPIC_API_KEY by design)"
+  if [ -f "$LOOM_ENV" ]; then
+    local perms; perms="$(stat -f '%Lp' "$LOOM_ENV" 2>/dev/null || stat -c '%a' "$LOOM_ENV" 2>/dev/null)"
+    if [ "$perms" = "600" ]; then pass "key file $LOOM_ENV (0600)"
+    else note "key file $LOOM_ENV mode is $perms — run: chmod 600 $LOOM_ENV"; fi
+    grep -q 'PASTE-YOUR' "$LOOM_ENV" && note "key file still has placeholder values"
+  else
+    note "no key file at $LOOM_ENV (aw sources it if present)"
+  fi
+  [ -n "${ZHIPU_API_KEY:-}" ]    && pass "ZHIPU_API_KEY set (Z.ai)"      || note "ZHIPU_API_KEY not set (ZAI_API_KEY also accepted)"
+  [ -n "${MOONSHOT_API_KEY:-}" ] && pass "MOONSHOT_API_KEY set"          || note "MOONSHOT_API_KEY not set"
+  [ -n "${DEEPSEEK_API_KEY:-}" ] && pass "DEEPSEEK_API_KEY set"          || note "DEEPSEEK_API_KEY not set"
+  [ -n "${ANTHROPIC_API_KEY:-}" ] && note "ANTHROPIC_API_KEY is set — this system never uses it; unset to be safe"
+
+  echo "project"
+  [ -x "$AGENTS_DIR/gate.sh" ] && pass ".agents/gate.sh executable" || fail ".agents/gate.sh missing or not executable"
+  if [ -f "$AGENTS_DIR/zones.toml" ]; then
+    python3 -c "import tomllib;tomllib.load(open('$AGENTS_DIR/zones.toml','rb'))" 2>/dev/null \
+      && pass "zones.toml parses" || fail "zones.toml does not parse"
+  else note "no zones.toml — everything defaults to assist"; fi
+  [ -x "$ROOT/.git/hooks/pre-commit" ] && pass "pre-commit hook installed" || note "pre-commit hook not installed (aw install-hooks)"
+
+  echo "model IDs (chains + opencode.json)"
+  local oc_models=""
+  have opencode && oc_models="$(cd "$ROOT" && opencode models 2>/dev/null || true)"
+  local catalog="${XDG_CACHE_HOME:-$HOME/.cache}/loom/models-dev.json"
+  mkdir -p "$(dirname "$catalog")"
+  if [ ! -s "$catalog" ] || [ -n "$(find "$catalog" -mtime +7 2>/dev/null)" ]; then
+    curl -sS --max-time 20 https://models.dev/api.json -o "$catalog" 2>/dev/null || true
+  fi
+  local m prov id key ep live
+  for m in $(all_referenced_models | sort -u); do
+    prov="${m%%/*}"; id="${m#*/}"
+    key="$(key_for_provider "$prov")"
+    if [ -n "$key" ] && [ -n "$oc_models" ] && ! echo "$oc_models" | grep -qx "$m"; then
+      fail "$m unknown to YOUR opencode — declare it under provider.$prov.models in .opencode/opencode.json, or update opencode"
+      continue
+    fi
+    ep="$(models_endpoint "$prov")"
+    if [ -n "$key" ] && [ -n "$ep" ] && have jq; then
+      live="$(curl -sS --max-time 15 -H "Authorization: Bearer $key" "$ep" 2>/dev/null | jq -r '.data[].id' 2>/dev/null || true)"
+      if [ -n "$live" ]; then
+        echo "$live" | grep -qx "$id" && pass "$m (live: your account can call it)" \
+          || fail "$m NOT in $prov's live /models — pick from: $(echo "$live" | tr '\n' ' ' | cut -c1-120)..."
+        continue
+      fi
+    fi
+    if [ -s "$catalog" ] && have jq; then
+      jq -e --arg p "$prov" --arg i "$id" '.[$p].models[$i] // empty' "$catalog" >/dev/null 2>&1 \
+        && pass "$m (models.dev catalog; set a key for the live check)" \
+        || fail "$m not in models.dev catalog — stale ID?"
+    else
+      note "$m unverified (no key, no catalog) — run: opencode models"
+    fi
+  done
+
+  echo ""
+  echo "aw doctor: $ok ok, $warn warnings, $bad failures"
+  [ "$bad" -eq 0 ]
+}
+
+cmd_install_hooks() {
+  local hook="$ROOT/.git/hooks/pre-commit"
+  mkdir -p "$(dirname "$hook")"
+  cat > "$hook" << 'HOOK'
+#!/usr/bin/env bash
+# Loom hand-zone guard. Logic lives in `aw guard` so it stays in one place.
+if command -v aw >/dev/null 2>&1; then
+  exec aw guard
+else
+  echo "pre-commit: aw not on PATH — hand-zone guard skipped" >&2
+  exit 0
+fi
+HOOK
+  chmod +x "$hook"
+  echo "aw: installed $hook"
+}
+
+# ------------------------------------------------------------------ dispatch
+case "${1:-}" in
+  new)    shift; cmd_new "$@" ;;
+  run)    shift; cmd_run "$@" ;;
+  check)  shift; cmd_check "$@" ;;
+  diff)   shift; cmd_diff "$@" ;;
+  land)   shift; cmd_land "$@" ;;
+  drop)   shift; cmd_drop "$@" ;;
+  ls)     shift; cmd_ls "$@" ;;
+  plan)   shift; cmd_plan "$@" ;;
+  scout)  shift; cmd_scout "$@" ;;
+  gate)   shift; cmd_gate "$@" ;;
+  zone)   shift; cmd_zone "$@" ;;
+  tier)   shift; cmd_tier "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  guard)  shift; cmd_guard "$@" ;;
+  install-hooks) shift; cmd_install_hooks "$@" ;;
+  ""|-h|--help|help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' — try: aw help" ;;
+esac
