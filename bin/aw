@@ -12,7 +12,8 @@
 #   aw check 0007-c                  cheap cross-provider review of the diff
 #   aw diff  0007-c                  open the task diff read-only in $EDITOR
 #   aw land  0007-c                  gate, merge, clean up, tick the checkbox
-#   aw drop  0007-c                  discard worktree and branch
+#   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
+#   aw drop  0007-c [--keep-branch]  discard worktree (and branch, unless kept)
 #   aw ls                            list active agent worktrees
 #   aw gate                          run the gate here
 #   aw zone  <path>                  which zone a path belongs to
@@ -26,6 +27,8 @@
 #   LOOM_SKIP="zai deepseek"       providers to skip     (claude|zai|moonshotai|deepseek)
 #   LOOM_MAX_ATTEMPTS=3            implementer gate retries
 #   LOOM_WORKTREES=/path           where worktrees live
+#   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
+#                                  for review (--pr / --merge win over this)
 #
 # Anthropic policy: subscription only, on purpose. The architect runs through
 # the `claude` CLI (your Claude Code login). There is no ANTHROPIC_API_KEY
@@ -172,42 +175,140 @@ run_role() { # run_role <role> <workdir> <prompt> [<logfile>]
 }
 
 # ---------------------------------------------------------------------- zones
-# hand > assist > auto, first match wins. Parsing is real TOML via python3.
-zone_of() { # zone_of <repo-relative-path>
-  python3 - "$1" "$AGENTS_DIR/zones.toml" << 'PY'
-import sys, fnmatch, os, tomllib
-path, zf = sys.argv[1], sys.argv[2]
-if not os.path.exists(zf):
-    print("assist"); sys.exit(0)
-with open(zf, "rb") as f:
-    data = tomllib.load(f)
+# hand > assist > auto, first match wins. Parsing is real TOML via python3:
+# tomllib on 3.11+, the `tomli` backport below that. One reader, several modes,
+# so the import dance lives in exactly one place.
+zones_py() { # zones_py <mode> [arg]   modes: parse|zone|fenced|fence-paths|fence-orphans
+  python3 - "$AGENTS_DIR/zones.toml" "$@" << 'PY'
+import sys, os, fnmatch, subprocess
+
+def die(msg):                        # exit 2 = "cannot answer", never "no"
+    sys.stderr.write("aw: %s\n" % msg)
+    raise SystemExit(2)
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        die("python >=3.11 or 'pip install tomli' required for zones")
+
+zf, mode, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+data = {}
+if os.path.exists(zf):
+    try:
+        with open(zf, "rb") as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        die("cannot read %s: %s" % (zf, e))
+fence = data.get("fence", {}).get("paths", [])
+
 def hit(p, g):
     if fnmatch.fnmatch(p, g): return True
     if g.endswith("/**"):
         base = g[:-3]
         return p == base or fnmatch.fnmatch(p, base + "/*")
     return False
-for zone in ("hand", "assist", "auto"):
-    for g in data.get(zone, {}).get("paths", []):
-        if hit(path, g):
-            print(zone); sys.exit(0)
-print("assist")
+
+def zone_of(path):
+    for zone in ("hand", "assist", "auto"):
+        for g in data.get(zone, {}).get("paths", []):
+            if hit(path, g):
+                return zone
+    return "assist"
+
+if mode == "parse":                                    # exit 0 = readable TOML
+    pass
+elif mode == "zone":
+    print(zone_of(args[0]))
+elif mode == "fenced":                                 # exit 0 = path is fenced
+    sys.exit(0 if any(hit(args[0], g) for g in fence) else 1)
+elif mode == "fence-paths":
+    for g in fence:
+        print(g)
+elif mode == "fence-orphans":                          # typo detection for doctor
+    tracked = subprocess.run(["git", "ls-files"], stdout=subprocess.PIPE,
+                             universal_newlines=True).stdout.splitlines()
+    for g in fence:
+        if not any(hit(p, g) for p in tracked):
+            print(g)
+else:
+    die("internal error: unknown zones mode '%s'" % mode)
 PY
 }
 
+zone_of() { # zone_of <repo-relative-path>   (fails loudly: callers gate commits)
+  zones_py zone "$1"
+}
+
+# Fence lookups fail CLOSED. If zones.toml cannot be read we do not know what is
+# fenced, and "nothing is fenced" would hand a fenced tree to a third-party
+# model. Parsed once per `aw` invocation and cached, so subshells inherit it.
+FENCE_PATTERNS=""
+FENCE_LOADED=""
+load_fence() {
+  [ -n "$FENCE_LOADED" ] && return 0
+  FENCE_PATTERNS="$(zones_py fence-paths)" \
+    || die "cannot determine the fence from .agents/zones.toml — refusing to guess"
+  FENCE_LOADED=yes
+}
+
+has_fence()      { load_fence; [ -n "$FENCE_PATTERNS" ]; }
+fence_patterns() { load_fence; printf '%s\n' "$FENCE_PATTERNS"; }
+
+is_fenced() { # is_fenced <path>   0 = fenced, 1 = not, dies if it cannot tell
+  local rc=0
+  zones_py fenced "$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "cannot determine the fence from .agents/zones.toml — refusing to guess" ;;
+  esac
+}
+
+# One sentence appended to agent prompts when a fence is configured.
+fence_note() {
+  has_fence || return 0
+  printf '%s' " Some paths are fenced off in .agents/zones.toml and are absent \
+from this worktree by policy; work around them and do not try to recover them \
+via git plumbing."
+}
+
+# Remove the fenced paths from a worktree with a non-cone sparse checkout:
+# '/*' takes the whole tree, each '!<glob>' subtracts one fenced set.
+# `sparse-checkout set --no-cone` only exists on git >= 2.36 (older git takes
+# the flag as a literal pattern), so set the mode with `init --no-cone`
+# (>= 2.25, worktree-scoped config) and let `set` inherit it.
+fence_apply() { # fence_apply <worktree>
+  local wt="$1" g
+  local -a pats=()
+  load_fence
+  while IFS= read -r g; do [ -n "$g" ] && pats+=("!$g"); done <<< "$FENCE_PATTERNS"
+  [ "${#pats[@]}" -gt 0 ] || return 0
+  git -C "$wt" sparse-checkout init --no-cone >&2
+  git -C "$wt" sparse-checkout set '/*' "${pats[@]}" >&2
+}
+
 cmd_zone() {
-  local p="${1:?usage: aw zone <path>}"
+  local p="${1:?usage: aw zone <path>}" z
   p="$(relpath "$p")"
-  echo "$p → $(zone_of "$p")"
+  z="$(zone_of "$p")" || die "zone lookup failed for $p"
+  if is_fenced "$p"; then
+    echo "$p → $z (fenced — removed from agent worktrees)"
+  else
+    echo "$p → $z"
+  fi
 }
 
 cmd_guard() { # pre-commit: reject agent/* commits touching hand-zone paths
   local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
   case "$branch" in agent/*) ;; *) return 0 ;; esac
-  local violations="" file
+  local violations="" file z
   while IFS= read -r file; do
     [ -n "$file" ] || continue
-    [ "$(zone_of "$file")" = hand ] && violations="$violations
+    z="$(zone_of "$file")" || { echo "pre-commit: zone lookup failed — refusing to guess" >&2; exit 1; }
+    [ "$z" = hand ] && violations="$violations
   $file"
   done < <(git diff --cached --name-only)
   if [ -n "$violations" ]; then
@@ -231,17 +332,25 @@ cmd_new() {
   [ -d "$wt" ] && die "worktree already exists: $wt"
   [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
   mkdir -p "$(dirname "$wt")"
-  git worktree add -b "$br" "$wt" HEAD >&2
+  if has_fence; then
+    # --no-checkout first, so fenced content never lands on disk here at all.
+    git worktree add --no-checkout -b "$br" "$wt" HEAD >&2
+    fence_apply "$wt"
+    git -C "$wt" checkout >&2
+  else
+    git worktree add -b "$br" "$wt" HEAD >&2
+  fi
   git config "branch.$br.loombase" "$(git rev-parse HEAD)"
   echo "$wt"
 }
 
 cmd_run() {
   local task="${1:?usage: aw run <task-id>}"
-  local wt br attempt=1 gate_note="" title
+  local wt br attempt=1 gate_note="" title fnote
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || wt="$(cmd_new "$task")"
   title="$(head -1 "$AGENTS_DIR/tasks/$task.md" | sed 's/^#[[:space:]]*//')"
+  load_fence; fnote="$(fence_note)"
 
   echo "aw: task $task  branch $br  tier $TIER"
   while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
@@ -251,7 +360,7 @@ Read the plan it references first. Touch only the files it lists — check \
 .agents/zones.toml and never edit hand-zone paths. Run ./.agents/gate.sh and \
 fix failures until it exits 0. Write brief notes on what you did to \
 .agents/reviews/$task-done.md. If you cannot proceed, write why to \
-.agents/reviews/$task-blocked.md and stop.$gate_note" || true
+.agents/reviews/$task-blocked.md and stop.$fnote$gate_note" || true
 
     if ( cd "$wt" && ./.agents/gate.sh > "$wt/.agents/reviews/$task-gate.log" 2>&1 ); then
       echo "aw: gate green"
@@ -302,15 +411,41 @@ cmd_diff() {
 }
 
 cmd_land() {
-  local task="${1:?usage: aw land <task-id>}"
-  local force="${2:-}"
-  local wt br plan
+  local task="" force="" mode="${LOOM_LAND:-merge}" a
+  local wt br plan title
+  for a in "$@"; do
+    case "$a" in
+      --force)      force=yes ;;
+      --pr)         mode="pr" ;;
+      --merge)      mode="merge" ;;
+      -*)           die "aw land: unknown flag '$a' — usage: aw land <task-id> [--pr|--merge] [--force]" ;;
+      *)            if [ -z "$task" ]; then task="$a"; else die "aw land: unexpected argument '$a'"; fi ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: aw land <task-id> [--pr|--merge] [--force]"
+  case "$mode" in merge|pr) ;; *) die "LOOM_LAND must be 'merge' or 'pr' (got '$mode')" ;; esac
   wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   [ -d "$wt" ] || die "no worktree for $task"
-  if [ "$force" != "--force" ]; then
+  if [ -z "$force" ]; then
     echo "aw: running gate in worktree before landing"
     ( cd "$wt" && ./.agents/gate.sh ) || die "gate is red in $br — fix it or land with: aw land $task --force"
   fi
+
+  if [ "$mode" = pr ]; then
+    git remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote — PR-mode landing needs one"
+    git push -u origin "$br"
+    title="$(head -1 "$AGENTS_DIR/tasks/$task.md" 2>/dev/null | sed 's/^#[[:space:]]*//')"
+    [ -n "$title" ] || title="$task"
+    echo ""
+    echo "aw: pushed $br. NOT merged — next steps are yours:"
+    echo ""
+    echo "    gh pr create --head $br --title \"agent($task): $title\""
+    echo ""
+    echo "aw: worktree kept at $wt (drop it once the PR exists: aw drop $task --keep-branch)"
+    echo "aw: tick the plan checkbox for $task by hand when the PR merges."
+    return 0
+  fi
+
   git merge --no-ff "$br" -m "land($task)"
   git worktree remove "$wt" --force
   git branch -d "$br"
@@ -320,11 +455,24 @@ cmd_land() {
 }
 
 cmd_drop() {
-  local task="${1:?usage: aw drop <task-id>}"
-  local wt br; wt="$(wt_path "$task")"; br="$(branch_of "$task")"
+  local task="" keep="" a
+  local wt br
+  for a in "$@"; do
+    case "$a" in
+      --keep-branch) keep=yes ;;
+      -*)            die "aw drop: unknown flag '$a' — usage: aw drop <task-id> [--keep-branch]" ;;
+      *)             if [ -z "$task" ]; then task="$a"; else die "aw drop: unexpected argument '$a'"; fi ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: aw drop <task-id> [--keep-branch]"
+  wt="$(wt_path "$task")"; br="$(branch_of "$task")"
   git worktree remove "$wt" --force 2>/dev/null || true
-  git branch -D "$br" 2>/dev/null || true
-  echo "aw: dropped $task"
+  if [ -n "$keep" ]; then
+    echo "aw: dropped worktree for $task — branch $br kept (it is on the remote)"
+  else
+    git branch -D "$br" 2>/dev/null || true
+    echo "aw: dropped $task"
+  fi
 }
 
 cmd_ls() { git worktree list | grep -F "$WT_ROOT" || echo "(no agent worktrees)"; }
@@ -353,9 +501,31 @@ file outside .agents/."
   fi
 }
 
+# Scout normally reads your working tree directly. With a fence configured it
+# must not, so it gets a persistent detached mirror at $WT_ROOT/_scout with the
+# fenced paths removed, reset to the current HEAD on every call (cheap).
+scout_root() {
+  local wt="$WT_ROOT/_scout" head
+  has_fence || { echo "$ROOT"; return 0; }
+  head="$(git rev-parse HEAD)"
+  mkdir -p "$(dirname "$wt")"
+  if [ -d "$wt" ]; then
+    fence_apply "$wt"
+    git -C "$wt" reset --hard "$head" >&2 \
+      || die "scout mirror is wedged: remove $wt and retry"
+  else
+    git worktree prune
+    git worktree add --detach --no-checkout "$wt" "$head" >&2
+    fence_apply "$wt"
+    git -C "$wt" checkout >&2
+  fi
+  echo "$wt"
+}
+
 cmd_scout() {
   local q="${*:?usage: aw scout \"<question>\"}"
-  run_role scout "$ROOT" "$q"
+  local wd; load_fence; wd="$(scout_root)"
+  run_role scout "$wd" "$q$(fence_note)"
 }
 
 cmd_gate() { exec "$AGENTS_DIR/gate.sh"; }
@@ -401,7 +571,13 @@ cmd_doctor() {
     have "$b" && pass "$b ($(command -v "$b"))" || fail "$b missing"
   done
   for b in tmux jq curl; do have "$b" && pass "$b" || note "$b missing (optional)"; done
-  python3 -c 'import tomllib' 2>/dev/null && pass "python3 tomllib" || fail "python3 lacks tomllib (need >=3.11)"
+  if python3 -c 'import tomllib' 2>/dev/null; then
+    pass "python3 tomllib (>=3.11)"
+  elif python3 -c 'import tomli' 2>/dev/null; then
+    pass "python3 tomli backport ($(python3 -c 'import sys;print("python %d.%d"%sys.version_info[:2])'))"
+  else
+    fail "python >=3.11 or 'pip install tomli' required for zones"
+  fi
 
   echo "provider keys (opencode built-ins; no ANTHROPIC_API_KEY by design)"
   if [ -f "$LOOM_ENV" ]; then
@@ -420,10 +596,28 @@ cmd_doctor() {
   echo "project"
   [ -x "$AGENTS_DIR/gate.sh" ] && pass ".agents/gate.sh executable" || fail ".agents/gate.sh missing or not executable"
   if [ -f "$AGENTS_DIR/zones.toml" ]; then
-    python3 -c "import tomllib;tomllib.load(open('$AGENTS_DIR/zones.toml','rb'))" 2>/dev/null \
-      && pass "zones.toml parses" || fail "zones.toml does not parse"
+    local nfence orphan
+    if zones_py parse >/dev/null 2>&1; then
+      pass "zones.toml parses"
+      nfence="$(zones_py fence-paths | grep -c . || true)"
+      if [ "${nfence:-0}" -gt 0 ]; then
+        pass "fence: $nfence pattern(s) removed from agent worktrees"
+        while IFS= read -r orphan; do
+          [ -n "$orphan" ] && note "fence pattern matches no tracked file (typo?): $orphan"
+        done < <(zones_py fence-orphans 2>/dev/null || true)
+      fi
+    else
+      fail "zones.toml unreadable (bad TOML, or no tomllib/tomli — see binaries): agent/* commits are BLOCKED until this is fixed"
+    fi
   else note "no zones.toml — everything defaults to assist"; fi
   [ -x "$ROOT/.git/hooks/pre-commit" ] && pass "pre-commit hook installed" || note "pre-commit hook not installed (aw install-hooks)"
+  if [ -x "$ROOT/.git/hooks/pre-commit.pre-loom" ]; then
+    pass "pre-existing pre-commit hook chained (pre-commit.pre-loom)"
+  fi
+  if [ "${LOOM_LAND:-merge}" = pr ]; then
+    have gh && pass "LOOM_LAND=pr — gh on PATH ($(command -v gh)); aw prints the command, never runs it" \
+             || note "LOOM_LAND=pr — gh not on PATH; open the PR from the printed branch by hand"
+  fi
 
   echo "model IDs (chains + opencode.json)"
   local oc_models=""
@@ -466,16 +660,29 @@ cmd_doctor() {
 
 cmd_install_hooks() {
   local hook="$ROOT/.git/hooks/pre-commit"
+  local prev="$hook.pre-loom"
   mkdir -p "$(dirname "$hook")"
+  # Never silently eat somebody else's hook: move it aside and chain to it.
+  # Re-running is a no-op because our own hook carries the marker string.
+  if [ -e "$hook" ] && ! grep -q 'Loom hand-zone guard' "$hook"; then
+    [ -e "$prev" ] && die "$hook is not Loom's and $prev already exists — merge them by hand, then re-run"
+    mv "$hook" "$prev"
+    echo "aw: existing pre-commit hook moved to $prev (it still runs, after the guard)"
+    [ -x "$prev" ] || echo "aw: note — $prev is not executable, so it stays inert (as it was)"
+  fi
   cat > "$hook" << 'HOOK'
 #!/usr/bin/env bash
 # Loom hand-zone guard. Logic lives in `aw guard` so it stays in one place.
+# Any hook that was here before is preserved as pre-commit.pre-loom and runs
+# after the guard, so installing Loom never disables an existing hook.
 if command -v aw >/dev/null 2>&1; then
-  exec aw guard
+  aw guard || exit $?
 else
   echo "pre-commit: aw not on PATH — hand-zone guard skipped" >&2
-  exit 0
 fi
+prev="$(dirname "$0")/pre-commit.pre-loom"
+[ -x "$prev" ] && exec "$prev" "$@"
+exit 0
 HOOK
   chmod +x "$hook"
   echo "aw: installed $hook"
@@ -498,6 +705,6 @@ case "${1:-}" in
   doctor) shift; cmd_doctor "$@" ;;
   guard)  shift; cmd_guard "$@" ;;
   install-hooks) shift; cmd_install_hooks "$@" ;;
-  ""|-h|--help|help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0" ;;
   *) die "unknown command '$1' — try: aw help" ;;
 esac

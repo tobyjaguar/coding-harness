@@ -8,7 +8,11 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 fail=0
 run() { echo "▶ $*" >&2; "$@" || fail=1; }
 
-if [ -f Cargo.toml ]; then
+# An explicit `gate` target in a Makefile is the repo telling you what its gate
+# is. Believe it, and skip auto-detection entirely.
+if [ -f Makefile ] && grep -qE '^gate:' Makefile; then
+  run make gate
+elif [ -f Cargo.toml ]; then
   run cargo fmt --all -- --check
   run cargo clippy --all-targets --quiet -- -D warnings
   run cargo test --quiet

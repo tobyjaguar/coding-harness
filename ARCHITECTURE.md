@@ -158,6 +158,53 @@ and the specification for free, and you still write the code. For learning Rust
 this is better than either extreme, because the hard part of Rust is not
 syntax — it is knowing what shape the solution should take.
 
+### Read fences
+
+`hand` is an *edit* boundary: agents still read those files, which is fine when
+the only thing at stake is your own practice. It is not fine when the thing at
+stake is a path you are contractually or ethically unwilling to send to a
+third-party model. The optional `[fence]` section is that second axis:
+
+```toml
+[fence]
+reason = "Client work under NDA — no third-party model sees this tree."
+paths = ["crates/audat-nda/**", "docs/audits/**"]
+```
+
+Fenced paths are **removed from agent worktrees**. `aw new` creates the worktree
+with `--no-checkout`, applies a non-cone sparse checkout (`/*` plus one
+`!<glob>` per fenced set), and only then checks out — so fenced content never
+lands in the agent's tree at all. `aw scout`, which otherwise reads your working
+tree directly, is redirected to a persistent detached mirror at
+`$LOOM_WORKTREES/_scout` under the same rules, reset to `HEAD` on each call.
+The implementer and scout prompts say the paths are absent by policy, so a
+confused agent asks instead of digging.
+
+**What this is and is not.** Four caveats, all of them load-bearing:
+
+1. **The object store is shared.** A worktree is a checkout, not a clone;
+   `.git` still holds every fenced blob, and `git show`, `git cat-file` or
+   `git sparse-checkout disable` reach them. The fence removes the files an
+   agent would stumble into — a `grep -r`, a directory listing, an over-eager
+   "let me read the whole repo" pass. It is a guard against **incidental
+   exposure, not against exfiltration by an adversarial agent.** If your threat
+   model includes the model actively trying to read what it was told not to,
+   you need a separate repository, not a sparse checkout.
+2. **Fenced code is genuinely missing from the build.** A fenced cargo
+   workspace member, python package or npm workspace will fail to build *in the
+   worktree*, because it is not there. Fence whole subsystems that you also
+   exclude from the gate, and scope agent tasks so they never need to compile
+   across the fence. A fence through the middle of a build graph produces an
+   agent that cannot pass a gate it cannot fix.
+3. **Matching is approximate in two dialects.** Sparse checkout applies
+   gitignore semantics (`*` stops at `/`); `aw zone` and `aw doctor` use
+   `fnmatch` (`*` crosses `/`). They agree on the plain `subsystem/**` form.
+   Stick to it. `aw doctor` flags a fence pattern that matches no tracked file,
+   which catches the usual typo.
+4. **It is per-worktree, not per-repo.** Your own working tree is untouched —
+   the sparse config is written to the worktree-scoped config, so nothing
+   disappears from under your editor.
+
 ---
 
 ## 6. Lockout avoidance, concretely
@@ -299,6 +346,14 @@ Included keymaps in `nvim/loom.lua`:
                     └───────▶  aw review / aw land
 ```
 
+`aw land` merges into your current branch and ticks the plan checkbox. In a
+repo with review gates, land in PR mode instead — `aw land <task> --pr`, or
+`LOOM_LAND=pr` in the environment — which runs the same gate, pushes
+`agent/<task>` to `origin`, and prints the `gh pr create` line for you to run.
+It merges nothing, keeps the branch and the worktree, and leaves the checkbox
+for you to tick when the PR actually merges. `aw drop <task> --keep-branch`
+reclaims the worktree afterwards without deleting the branch you just pushed.
+
 The architect is invoked at the start of a feature and when a plan turns out to
 be wrong. Not otherwise. If you find yourself in a long conversation with the
 expensive model, that is the signal to stop and write a plan file instead.
@@ -351,7 +406,9 @@ architect treat uncited claims as unknown.
 4. `.opencode/opencode.json` — set your API keys as env vars, run
    `opencode models` to confirm current model IDs before trusting the ones in the
    config.
-5. Install the pre-commit hook: `bin/aw install-hooks`.
+5. Install the pre-commit hook: `bin/aw install-hooks`. An existing hook is
+   moved to `.git/hooks/pre-commit.pre-loom` and chained after the guard, so
+   installing Loom never disables the hook you already had.
 6. Run one small feature end to end before trusting it with anything real.
 
 Model IDs move quickly. Verify them with `aw doctor`: it checks every ID in
