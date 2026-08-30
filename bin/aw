@@ -581,7 +581,10 @@ cmd_doctor() {
 
   echo "provider keys (opencode built-ins; no ANTHROPIC_API_KEY by design)"
   if [ -f "$LOOM_ENV" ]; then
-    local perms; perms="$(stat -f '%Lp' "$LOOM_ENV" 2>/dev/null || stat -c '%a' "$LOOM_ENV" 2>/dev/null)"
+    # GNU first: BSD's -f is GNU's "file SYSTEM status", which SUCCEEDS on Linux
+    # and prints a block of filesystem stats instead of a mode. GNU's -c fails
+    # cleanly on BSD, so this order is the one that works on both.
+    local perms; perms="$(stat -c '%a' "$LOOM_ENV" 2>/dev/null || stat -f '%Lp' "$LOOM_ENV" 2>/dev/null)"
     if [ "$perms" = "600" ]; then pass "key file $LOOM_ENV (0600)"
     else note "key file $LOOM_ENV mode is $perms — run: chmod 600 $LOOM_ENV"; fi
     grep -q 'PASTE-YOUR' "$LOOM_ENV" && note "key file still has placeholder values"
