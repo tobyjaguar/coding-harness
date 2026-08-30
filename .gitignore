@@ -1,2 +1,13 @@
 .DS_Store
 *.log
+.env
+.env.*
+*.pem
+*.key
+env
+.agents/reviews/*
+!.agents/reviews/.gitkeep
+.agents/plans/*
+!.agents/plans/.gitkeep
+.agents/tasks/*
+!.agents/tasks/.gitkeep

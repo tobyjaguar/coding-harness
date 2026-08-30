@@ -1,5 +1,10 @@
 # Loom — a Vim-native agent system
 
+> Personal coding harness, shared as-is under MIT. It works on the machines
+> it was built for; `aw doctor` will tell you what yours is missing. Model
+> IDs in configs go stale fast — verify before trusting, as the docs say.
+> No support implied; issues and forks welcome.
+
 Read `ARCHITECTURE.md` for the design and reasoning. This is the manifest and
 quickstart.
 
