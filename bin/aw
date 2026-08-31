@@ -140,15 +140,20 @@ looks_rate_limited() { # looks_rate_limited <logfile>
   grep -qiE '429|rate[ _-]?limit|too many request|quota|overloaded|exhaust|usage limit|insufficient[ _-]?(balance|quota|credit)' "$1" 2>/dev/null
 }
 
+# Headless model calls read stdin for appended message input when it is a
+# non-TTY stream; a caller that keeps stdin open (CI, cron, another agent's
+# shell) therefore hangs the run forever in poll. Found live: `aw run` from a
+# backgrounded shell sat 100 minutes in ep_poll before the first model call.
+# /dev/null guarantees EOF for both legs.
 run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
   local role="$1" model="$2" wd="$3" prompt="$4" log="$5" rc=0
   if [ "$model" = claude-sub ]; then
     ( cd "$wd" && claude -p \
         --append-system-prompt "$(cat "$PROMPTS_DIR/$role.md")" \
-        "$prompt" ) > "$log" 2>&1 || rc=$?
+        "$prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
   else
     ( cd "$wd" && opencode run --agent "$role" --model "$model" "$prompt" ) \
-      > "$log" 2>&1 || rc=$?
+      < /dev/null > "$log" 2>&1 || rc=$?
   fi
   cat "$log"
   return $rc
