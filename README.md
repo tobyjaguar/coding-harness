@@ -10,11 +10,12 @@ quickstart.
 
 ## Billing policy (the point of all this)
 
-Two flat subscriptions do the work; pay-per-token APIs are only a relief valve:
+Flat subscriptions do the work; pay-per-token APIs are only a relief valve:
 
 | Surface | Billing | Used for |
 |---|---|---|
 | Claude subscription (`claude` CLI) | flat | architect (+ reviewer at `deep` tier) |
+| ChatGPT subscription (`codex` CLI) | flat | reviewer — first in the `standard` and `deep` chains |
 | GLM Coding Plan (Z.ai, `ZHIPU_API_KEY`) | flat | scout, implementer — the ~85% token share |
 | DeepSeek / Moonshot API keys | per-token, cheap | fallback when a sub window is exhausted; decorrelated review |
 
@@ -41,6 +42,8 @@ bin/loom-session           tmux layout, works with plain vim
                            Enforced by pre-commit hook (hand) and sparse
                            checkout (fence).
   PLAN_TEMPLATE.md  TASK_TEMPLATE.md
+  loom.env                 optional. Per-project model chains and keys,
+                           sourced after the global key file.
   plans/  tasks/  decisions/  reviews/
 
 .opencode/
@@ -58,7 +61,9 @@ nvim/codecompanion.lua     optional editor-chat layer (Neovim only)
 [`opencode`](https://opencode.ai) and the `claude` CLI (logged in to your
 subscription). `tmux` optional (for `loom-session`). Everything is
 GNU/BSD-portable — the same scripts run on macOS and Linux; `aw doctor`
-verifies a new machine in one shot.
+verifies a new machine in one shot. `codex` optional (a second subscription
+reviewer — see below); without it the reviewer chain just starts one entry
+later.
 
 ## New machine bootstrap (Linux or macOS)
 
@@ -140,6 +145,51 @@ Tasks marked `HAND` in the plan you write yourself. That is deliberate —
 those, and the pre-commit hook enforces the boundary.
 
 When you hit a rate limit anywhere: `eval "$(aw tier lean)"` and keep going.
+
+### Codex as a reviewer (codex-sub)
+
+`codex-sub` is the OpenAI Codex CLI run headless on your ChatGPT subscription: a
+second flat-rate reviewer, from a different lab than the model that wrote the
+code, at no per-token cost. It sits first in the `standard` and `deep` reviewer
+chains and is skipped silently where the CLI or the login is missing, so a
+machine without it behaves exactly as before.
+
+```sh
+npm i -g @openai/codex          # or: brew install codex
+codex login                     # browser; writes ~/.codex/auth.json
+aw doctor                       # checks the binary and that auth file
+```
+
+`aw` invokes it as `codex exec --sandbox read-only`: a reviewer reads a diff and
+answers, it never writes to the worktree. Only the model's final message lands
+in `.agents/reviews/<task>-review.md` — the run transcript is kept just long
+enough to spot a rate limit, which falls through to the next model in the chain
+like any other provider. `LOOM_SKIP="codex"` takes it out.
+
+Any role's chain can be replaced from the environment, without editing `aw`:
+
+```sh
+export LOOM_MODELS_reviewer="codex-sub deepseek/deepseek-v4-pro"
+```
+
+Per project, put those same lines in `.agents/loom.env` — sourced after the
+global key file, so the project wins. Commit it or ignore it, as the project
+prefers.
+
+### Bounded review loop
+
+```sh
+aw loop 0007-c                       # run, review, feed a REVISE back, review again
+LOOM_LOOP_ROUNDS=3 aw loop 0007-c    # default is 2
+```
+
+`aw run`, then `aw check`, up to `LOOM_LOOP_ROUNDS` rounds. `VERDICT: APPROVE`
+ends it and hands you `aw diff` / `aw land`. `VERDICT: REVISE` appends the
+review to the task file *inside the worktree* — never your tree — and re-runs
+the implementer against it. A REVISE on the last round stops and escalates to
+you: disagreement that survives the rounds is a spec problem, not a model
+problem. A review with no verdict line at all is treated as truncated, not as a
+rejection, and stops the loop without another implementer pass.
 
 ### PR-mode landing
 

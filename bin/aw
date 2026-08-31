@@ -10,6 +10,7 @@
 #   aw new   0007-c                  create worktree + branch for a task
 #   aw run   0007-c                  run the implementer in that worktree
 #   aw check 0007-c                  cheap cross-provider review of the diff
+#   aw loop  0007-c                  run, review, feed REVISE back, review again
 #   aw diff  0007-c                  open the task diff read-only in $EDITOR
 #   aw land  0007-c                  gate, merge, clean up, tick the checkbox
 #   aw land  0007-c --pr             gate, push agent/0007-c, print PR next steps
@@ -26,6 +27,8 @@
 #   LOOM_TIER=lean|standard|deep   model tier            (default standard)
 #   LOOM_SKIP="zai deepseek"       providers to skip     (claude|zai|moonshotai|deepseek)
 #   LOOM_MAX_ATTEMPTS=3            implementer gate retries
+#   LOOM_LOOP_ROUNDS=2             review rounds in `aw loop`
+#   LOOM_MODELS_<role>="m1 m2"     replace one role's chain outright
 #   LOOM_WORKTREES=/path           where worktrees live
 #   LOOM_LAND=merge|pr             land by merging here, or by pushing a branch
 #                                  for review (--pr / --merge win over this)
@@ -53,6 +56,9 @@ SKIP="${LOOM_SKIP:-}"
 # keys ever entering a repo or a shell profile.
 LOOM_ENV="${LOOM_ENV:-$HOME/.config/loom/env}"
 if [ -f "$LOOM_ENV" ]; then set -a; . "$LOOM_ENV"; set +a; fi
+# Project-scoped model chains and keys, checked into or ignored by the project
+# as it prefers. Sourced second, so a project overrides the global file.
+if [ -f "$ROOT/.agents/loom.env" ]; then set -a; . "$ROOT/.agents/loom.env"; set +a; fi
 for _k in ZHIPU_API_KEY ZAI_API_KEY DEEPSEEK_API_KEY MOONSHOT_API_KEY; do
   case "$(eval "echo \"\${$_k:-}\"")" in *PASTE-YOUR*) unset "$_k" ;; esac
 done
@@ -79,10 +85,15 @@ relpath() { # relpath <path> [<base>]
 
 # ---------------------------------------------------------------- model tiers
 # Ordered fallback chains. "claude-sub" means the `claude` CLI on your
-# subscription; everything else is opencode's built-in provider/model IDs.
+# subscription and "codex-sub" the `codex` CLI on your ChatGPT one; everything
+# else is opencode's built-in provider/model IDs.
 # Verify IDs with: aw doctor   (they move fast)
 models_for() {
-  local role="$1"
+  local role="$1" override
+  # LOOM_MODELS_reviewer="codex-sub deepseek/deepseek-v4-pro" replaces the whole
+  # chain for one role. printenv, not eval: the value is data, not shell.
+  override="$(printenv "LOOM_MODELS_$role" 2>/dev/null || true)"
+  if [ -n "$override" ]; then echo "$override"; return 0; fi
   case "$TIER:$role" in
     deep:architect|standard:architect)
                          echo "claude-sub zai-coding-plan/glm-5.3 moonshotai/kimi-k2.5" ;;
@@ -92,8 +103,8 @@ models_for() {
     standard:implementer|lean:implementer)
                          echo "zai-coding-plan/glm-5.3 deepseek/deepseek-v4-pro moonshotai/kimi-k2.5" ;;
 
-    deep:reviewer)       echo "claude-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro" ;;
-    standard:reviewer)   echo "moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro zai-coding-plan/glm-5.3" ;;
+    deep:reviewer)       echo "codex-sub claude-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro" ;;
+    standard:reviewer)   echo "codex-sub moonshotai/kimi-k2.5 deepseek/deepseek-v4-pro zai-coding-plan/glm-5.3" ;;
     lean:reviewer)       echo "deepseek/deepseek-v4-flash zai-coding-plan/glm-5.3-flash" ;;
 
     *:scout)             echo "zai-coding-plan/glm-5.3-flash deepseek/deepseek-v4-flash" ;;
@@ -111,7 +122,7 @@ key_for_provider() {
   esac
 }
 
-provider_of() { case "$1" in claude-sub) echo "claude" ;; *) echo "${1%%/*}" ;; esac; }
+provider_of() { case "$1" in claude-sub) echo "claude" ;; codex-sub) echo "codex" ;; *) echo "${1%%/*}" ;; esac; }
 
 skipped() { # skipped <provider>
   local p
@@ -126,6 +137,10 @@ usable() { # usable <model-token>
   local prov; prov="$(provider_of "$1")"
   skipped "$prov" && return 1
   if [ "$1" = claude-sub ]; then have claude
+  elif [ "$1" = codex-sub ]; then
+    # A ChatGPT login writes ~/.codex/auth.json; an API key is the other way in.
+    have codex && { [ -f "${CODEX_HOME:-$HOME/.codex}/auth.json" ] \
+                 || [ -n "${CODEX_API_KEY:-}${OPENAI_API_KEY:-}" ]; }
   else [ -n "$(key_for_provider "$prov")" ] && have opencode; fi
 }
 
@@ -146,11 +161,28 @@ looks_rate_limited() { # looks_rate_limited <logfile>
 # backgrounded shell sat 100 minutes in ep_poll before the first model call.
 # /dev/null guarantees EOF for both legs.
 run_headless() { # run_headless <role> <model> <workdir> <prompt> <logfile>
-  local role="$1" model="$2" wd="$3" prompt="$4" log="$5" rc=0
+  local role="$1" model="$2" wd="$3" prompt="$4" log="$5" rc=0 last=""
   if [ "$model" = claude-sub ]; then
     ( cd "$wd" && claude -p \
         --append-system-prompt "$(cat "$PROMPTS_DIR/$role.md")" \
         "$prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
+  elif [ "$model" = codex-sub ]; then
+    # `codex exec` has no --append-system-prompt, so the role prompt is
+    # prepended to the message instead. read-only sandbox: a reviewer reads a
+    # diff, it never writes. --skip-git-repo-check because a worktree parked
+    # under $WT_ROOT can read as "outside a repository"; harmless in one.
+    # The transcript is banner + answer + "tokens used", but cmd_check copies
+    # the log verbatim into the review file, so the final message goes to a
+    # sidecar and replaces the log on success. A failed run keeps the
+    # transcript: looks_rate_limited reads it.
+    last="$(mktemp "${TMPDIR:-/tmp}/aw-codex.XXXXXX")"
+    ( cd "$wd" && codex exec --sandbox read-only --skip-git-repo-check \
+        --output-last-message "$last" \
+        "$(cat "$PROMPTS_DIR/$role.md")
+
+$prompt" ) < /dev/null > "$log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -s "$last" ]; then cat "$last" > "$log"; fi
+    rm -f "$last"
   else
     ( cd "$wd" && opencode run --agent "$role" --model "$model" "$prompt" ) \
       < /dev/null > "$log" 2>&1 || rc=$?
@@ -478,6 +510,67 @@ and end with a final line 'VERDICT: APPROVE' or 'VERDICT: REVISE — <reason>'."
   echo "aw: review saved to $(relpath "$review")"
 }
 
+# Bounded implement -> review -> fix -> review. A reviewer that still says
+# REVISE after LOOM_LOOP_ROUNDS rounds is a spec problem, not a model problem,
+# so the loop escalates to you instead of burning tokens on another round.
+# The REVISE text is appended to the task file INSIDE the worktree: the copy
+# the implementer reads, and never your tree.
+cmd_loop() {
+  local task="${1:?usage: aw loop <task-id>}"
+  local rounds="${LOOM_LOOP_ROUNDS:-2}"
+  local wt review verdict tfile i=1
+  wt="$(wt_path "$task")"
+
+  # cmd_run is reached through `||` below, which switches set -e off for its
+  # whole body. Its preconditions are therefore checked HERE: a cmd_new that
+  # dies inside cmd_run's command substitution would otherwise leave $wt empty
+  # and run the implementer — and `git add -A && git commit` — in YOUR tree.
+  [ -f "$AGENTS_DIR/tasks/$task.md" ] || die "no task file: .agents/tasks/$task.md"
+  [ -d "$wt" ] || cmd_new "$task" > /dev/null
+
+  implement() { # one implementer pass, with cmd_run's exit codes named
+    local rc=0
+    cmd_run "$task" || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      2) die "aw loop: implementer reported blocked — read $(relpath "$wt/.agents/reviews/$task-blocked.md")" ;;
+      *) die "aw loop: implementer never reached a green gate for $task — the spec is probably wrong" ;;
+    esac
+  }
+
+  implement
+  review="$wt/.agents/reviews/$task-review.md"
+  tfile="$wt/.agents/tasks/$task.md"
+  while [ "$i" -le "$rounds" ]; do
+    echo "aw: [loop] review round $i/$rounds"
+    cmd_check "$task"
+    verdict="$(grep '^VERDICT:' "$review" 2>/dev/null | tail -1 || true)"
+    # No verdict line at all means a truncated or derailed review, not a
+    # rejection — re-implementing on it would act on nothing.
+    [ -n "$verdict" ] || die "no VERDICT line in $(relpath "$review") — review truncated — re-run aw check $task"
+    case "$verdict" in
+      *APPROVE*) echo "aw: [loop] APPROVE after $i round(s) — next: aw diff $task && aw land $task"
+                 return 0 ;;
+    esac
+    if [ "$i" -eq "$rounds" ]; then
+      echo "aw: [loop] still REVISE after $rounds round(s) — escalating to the coordinator." >&2
+      echo "aw: [loop] read $(relpath "$review"), then fix the task spec by hand." >&2
+      return 1
+    fi
+    [ -f "$tfile" ] || die "no task file in the worktree at $tfile — is .agents/tasks/ gitignored? commit it so agent worktrees see it"
+    {
+      printf '\n## Auto fix round %s (aw loop — reviewer REVISE)\n\n' "$i"
+      printf '%s\n' "The reviewer returned REVISE. Address every point below. Keep all existing"
+      printf '%s\n' "rulings from earlier rounds; do not weaken or delete tests to satisfy the"
+      printf '%s\n\n' "reviewer."
+      cat "$review"
+    } >> "$tfile"
+    echo "aw: [loop] REVISE — fix round $i appended to $(relpath "$tfile" "$wt") in the worktree"
+    implement
+    i=$((i + 1))
+  done
+}
+
 cmd_diff() {
   local task="${1:?usage: aw diff <task-id>}"
   local wt base patch
@@ -643,7 +736,7 @@ all_referenced_models() {
     for r in architect scout implementer reviewer; do
       TIER=$t models_for "$r"
     done
-  done | tr ' ' '\n' | grep -v '^claude-sub$' | grep . | sort -u
+  done | tr ' ' '\n' | grep -vE '^(claude|codex)-sub$' | grep . | sort -u
   # plus whatever opencode.json pins
   [ -f "$ROOT/.opencode/opencode.json" ] && have jq && \
     jq -r '.. | .model? // empty' "$ROOT/.opencode/opencode.json" | sort -u
@@ -660,7 +753,7 @@ cmd_doctor() {
   for b in git python3 claude opencode; do
     have "$b" && pass "$b ($(command -v "$b"))" || fail "$b missing"
   done
-  for b in tmux jq curl; do have "$b" && pass "$b" || note "$b missing (optional)"; done
+  for b in tmux jq curl codex; do have "$b" && pass "$b" || note "$b missing (optional)"; done
   if python3 -c 'import tomllib' 2>/dev/null; then
     pass "python3 tomllib (>=3.11)"
   elif python3 -c 'import tomli' 2>/dev/null; then
@@ -685,6 +778,19 @@ cmd_doctor() {
   [ -n "${MOONSHOT_API_KEY:-}" ] && pass "MOONSHOT_API_KEY set"          || note "MOONSHOT_API_KEY not set"
   [ -n "${DEEPSEEK_API_KEY:-}" ] && pass "DEEPSEEK_API_KEY set"          || note "DEEPSEEK_API_KEY not set"
   [ -n "${ANTHROPIC_API_KEY:-}" ] && note "ANTHROPIC_API_KEY is set — this system never uses it; unset to be safe"
+  if have codex; then
+    local cauth="${CODEX_HOME:-$HOME/.codex}/auth.json"
+    if [ -f "$cauth" ]; then
+      pass "codex auth.json present ($cauth) — codex-sub usable"
+      if [ -n "$(find "$cauth" -mtime +9 2>/dev/null)" ]; then
+        note "codex auth.json last changed >9 days ago — the subscription token refreshes in place on use, so run 'codex login' only if codex exec fails"
+      fi
+    elif [ -n "${CODEX_API_KEY:-}${OPENAI_API_KEY:-}" ]; then
+      pass "codex on CODEX_API_KEY/OPENAI_API_KEY (per-token, not the subscription)"
+    else
+      note "codex is installed but has no $cauth and no CODEX_API_KEY/OPENAI_API_KEY — run: codex login"
+    fi
+  fi
 
   echo "project"
   [ -x "$AGENTS_DIR/gate.sh" ] && pass ".agents/gate.sh executable" || fail ".agents/gate.sh missing or not executable"
@@ -793,6 +899,7 @@ case "${1:-}" in
   new)    shift; cmd_new "$@" ;;
   run)    shift; cmd_run "$@" ;;
   check)  shift; cmd_check "$@" ;;
+  loop)   shift; cmd_loop "$@" ;;
   diff)   shift; cmd_diff "$@" ;;
   land)   shift; cmd_land "$@" ;;
   drop)   shift; cmd_drop "$@" ;;
