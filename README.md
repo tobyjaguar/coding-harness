@@ -176,6 +176,13 @@ Per project, put those same lines in `.agents/loom.env` — sourced after the
 global key file, so the project wins. Commit it or ignore it, as the project
 prefers.
 
+Note on precedence: `aw` sources the project `.agents/loom.env` after
+reading the environment, so a plain `VAR=value` assignment there would
+clobber a per-command override like `LOOM_MODELS_reviewer=... aw check`.
+Write project pins with default-if-unset expansion —
+`LOOM_MODELS_reviewer="${LOOM_MODELS_reviewer:-codex-sub deepseek/deepseek-v4-pro}"`
+— so the command line always wins.
+
 ### Bounded review loop
 
 ```sh

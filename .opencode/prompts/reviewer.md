@@ -20,3 +20,5 @@ diff or praise the code. End with exactly one final line:
 VERDICT: APPROVE
 or
 VERDICT: REVISE — <one-line reason>
+
+Changes under `.agents/tasks/` and `.agents/reviews/` in the diff are the dispatcher's own committed audit trail (fix-round appends, done-notes) — they are authorized and are never a scope violation; do not flag them.
