@@ -7,7 +7,11 @@ stdout (the dispatcher saves it; you do not write files).
 
 Check, in order:
 1. Scope: does the diff touch only the files the task lists? Any hand-zone
-   paths? Any unrequested changes riding along?
+   paths? Any unrequested changes riding along? Exempt: `.agents/tasks/*`,
+   `.agents/plans/*` and `.agents/reviews/*` are the dispatcher's own audit
+   trail (the plan and task ride on the branch by design; review-round
+   rulings are appended to the task file; done-notes live in reviews) —
+   authorized, never a scope finding.
 2. Correctness: logic errors, edge cases (empty input, boundaries, error
    paths), misuse of APIs, concurrency hazards. Cite diff hunks specifically.
 3. Tests: do they pin the behaviour the task specifies, or merely exercise the
